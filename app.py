@@ -83,7 +83,7 @@ def comparison_slider(b64_before: str, b64_after: str) -> None:
            style="position:absolute;top:0;left:0;width:50%;height:100%;
                   overflow:hidden;border-right:3px solid #16a34a;">
         <img src="{b64_after}"
-             style="display:block;width:100%;height:auto;max-height:320px;
+             style="display:block;width:100%;height:100%;
                     object-fit:contain;background:#ffffff;position:absolute;
                     top:0;left:0;" id="cmpAfterImg"/>
       </div>
@@ -218,6 +218,7 @@ with st.sidebar:
     st.caption(
         "Image Studio Pro v2.0  \n"
         "Built with Python · Streamlit · Pillow  \n"
+        "🌐 [Live App](https://imageconverterpro.streamlit.app/)  \n"
         "🔒 No uploads · No sign-up · Fully local"
     )
 
@@ -587,6 +588,7 @@ def render_settings() -> None:
     st.markdown(
         "**Image Studio Pro v2.0**  \n"
         "Built with Python · Streamlit · Pillow  \n"
+        "🌐 **Live App:** [imageconverterpro.streamlit.app](https://imageconverterpro.streamlit.app/)  \n"
         "Open source · No sign-up · No upload limits"
     )
 
