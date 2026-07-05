@@ -1,2 +1,6 @@
 streamlit
 pillow
+rembg[cpu]
+easyocr
+plotly
+pandas
