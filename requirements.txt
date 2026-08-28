@@ -1,6 +1,7 @@
 streamlit
 pillow
 rembg[cpu]
+opencv-python-headless
 easyocr
 plotly
 pandas
