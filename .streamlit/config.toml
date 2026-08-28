@@ -9,4 +9,8 @@ showErrorDetails = true
 toolbarMode = "minimal"
 
 [theme]
-base = "dark"
+base = "light"
+primaryColor = "#10B981"
+backgroundColor = "#FBFBFA"
+secondaryBackgroundColor = "#F8FAFC"
+textColor = "#0F172A"

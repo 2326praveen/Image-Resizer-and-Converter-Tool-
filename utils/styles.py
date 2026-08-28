@@ -68,6 +68,12 @@ header[data-testid="stHeader"] {{
 }}
 [data-testid="stDecoration"] {{ display: none !important; }}
 #MainMenu, footer {{ display: none !important; }}
+header[data-testid="stHeader"],
+.stAppHeader,
+div[data-testid="stToolbar"] {{
+    background: transparent !important;
+    background-color: transparent !important;
+}}
 
 /* ══════════════════════════════════════════════
    APP CONTAINER & GLOBAL AMBIENT GLOW
