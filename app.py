@@ -43,6 +43,22 @@ from utils.analytics import (
     OP_RESIZE, OP_BATCH, OP_BG_REMOVE, OP_OCR, OP_WATERMARK,
 )
 
+# ── Optional auth utilities (graceful degradation) ─────────────────────────
+# If supabase is not installed, secrets are missing, or secrets are invalid,
+# AUTH_AVAILABLE stays False and the login UI is never shown.  Guests are
+# completely unaffected — every existing feature works as today.
+AUTH_AVAILABLE = False
+try:
+    from utils.auth import sign_up, sign_in, sign_out, is_logged_in, get_current_user
+    from utils.persistence import save_history_entry, load_history, to_app_shape
+    # Confirm both secrets exist before marking auth as available
+    _sb_url = st.secrets.get("SUPABASE_URL", "")
+    _sb_key = st.secrets.get("SUPABASE_ANON_KEY", "")
+    if _sb_url and _sb_key:
+        AUTH_AVAILABLE = True
+except Exception:
+    pass
+
 # ══════════════════════════════════════════════
 #  PAGE CONFIG
 # ══════════════════════════════════════════════
@@ -57,62 +73,58 @@ st.set_page_config(
 #  SESSION STATE — initialise all keys
 # ══════════════════════════════════════════════
 _defaults = {
-    "section":       "upload",
-    "dark":          False,
-    "history":       [],
-    "batch_results": [],
-    "analytics":     [],          # NEW: per-session analytics log
-    "ocr_result":    None,        # NEW: cache last OCR result
-    "wm_preview":    None,        # NEW: cache watermark preview bytes
+    "section":        "upload",
+    "dark":           False,
+    "history":        [],
+    "batch_results":  [],
+    "analytics":      [],          # per-session analytics log
+    "ocr_result":     None,        # cache last OCR result
+    "wm_preview":     None,        # cache watermark preview bytes
+    "history_seeded": False,       # auth: prevents double-loading persisted history
+    "entered_app":    False,       # gating: landing page vs main tool
+    "landing_auth":   None,        # landing auth drawer state: None | 'login' | 'signup'
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 dark = st.session_state.dark
+is_landing = not st.session_state.entered_app
+
+# ── Seed session history from Supabase once per session (logged-in users only) ──
+if AUTH_AVAILABLE and is_logged_in() and not st.session_state.history_seeded:
+    try:
+        _db_rows = load_history()
+        if _db_rows:
+            _seeded = [to_app_shape(r) for r in _db_rows]
+            st.session_state.history = _seeded + st.session_state.history
+            _analytics_from_db = []
+            for _r, _e in zip(_db_rows, _seeded):
+                _fmt = _e.get("out_fmt", "").upper()
+                _op  = OP_OCR if _fmt == "TXT" else OP_RESIZE
+                _ts  = _e.get("ts", "")
+                _ts_str = _ts[:19].replace("T", " ") if "T" in _ts else _ts[:19]
+                _analytics_from_db.append({
+                    "Timestamp":    _ts_str,
+                    "Operation":    _op,
+                    "File":         _e.get("name", "—"),
+                    "Original (B)": _e.get("orig_sz", 0),
+                    "Output (B)":   _e.get("out_sz",  0),
+                    "Saved (B)":    max(0, _e.get("orig_sz", 0) - _e.get("out_sz", 0)),
+                    "Saved (%)":    round(_r.get("compression_pct", 0.0), 1),
+                    "Format":       _fmt,
+                })
+            st.session_state.analytics = _analytics_from_db + st.session_state.analytics
+    except Exception:
+        pass
+    st.session_state.history_seeded = True
 
 # ══════════════════════════════════════════════
 #  CSS + DECORATIONS
 # ══════════════════════════════════════════════
-st.markdown(get_css(dark), unsafe_allow_html=True)
-# Ambient blobs — position:fixed decorations
-st.markdown(
-    '<div class="blob blob1"></div><div class="blob blob2"></div><div class="blob blob3"></div>',
-    unsafe_allow_html=True,
-)
-# 3D neon orbs + glass rings
-st.markdown("""
-<div class="orb orb-cyan"  style="width:420px;height:420px;top:-180px;right:5%;"></div>
-<div class="orb orb-purple" style="width:380px;height:380px;bottom:-160px;left:8%;"></div>
-<div class="orb orb-emerald" style="width:300px;height:300px;top:45%;right:25%;"></div>
-<div class="glass-ring" style="width:500px;height:500px;top:-200px;left:-200px;"></div>
-<div class="glass-ring" style="width:360px;height:360px;bottom:-150px;right:-120px;animation-delay:-3s;"></div>
-""", unsafe_allow_html=True)
-# JS: mouse-tracking 3D tilt for .tilt-3d elements
-st.markdown("""
-<script>
-(function(){
-  function initTilt(){
-    document.querySelectorAll('.tilt-3d').forEach(function(el){
-      el.addEventListener('mousemove',function(e){
-        var r=el.getBoundingClientRect();
-        var dx=(e.clientX-(r.left+r.width/2))/(r.width/2);
-        var dy=(e.clientY-(r.top+r.height/2))/(r.height/2);
-        el.style.transform='perspective(900px) rotateY('+(dx*9)+'deg) rotateX('+(-dy*9)+'deg) translateZ(14px)';
-        el.style.transition='transform 0.08s ease';
-      });
-      el.addEventListener('mouseleave',function(){
-        el.style.transform='perspective(900px) rotateY(0) rotateX(0) translateZ(0)';
-        el.style.transition='transform 0.55s ease';
-      });
-    });
-  }
-  var obs=new MutationObserver(initTilt);
-  obs.observe(document.body,{childList:true,subtree:true});
-  initTilt();
-})();
-</script>
-""", unsafe_allow_html=True)
+st.markdown(get_css(dark, is_landing=is_landing), unsafe_allow_html=True)
+# ── Minimal hero tilt (3°) — hero card only, no blobs/orbs/rings ──
+
 
 
 # ══════════════════════════════════════════════
@@ -120,19 +132,30 @@ st.markdown("""
 # ══════════════════════════════════════════════
 def time_ago(iso: str) -> str:
     """Return a human-readable 'time ago' string from an ISO timestamp."""
-    diff = (datetime.now() - datetime.fromisoformat(iso)).total_seconds()
+    dt = datetime.fromisoformat(iso)
+    if dt.tzinfo is not None:          # strip tz-awareness (Supabase created_at)
+        dt = dt.replace(tzinfo=None)
+    diff = (datetime.now() - dt).total_seconds()
     if diff < 60:    return "Just now"
     if diff < 3600:  return f"{int(diff / 60)}m ago"
     if diff < 86400: return f"{int(diff / 3600)}h ago"
     return f"{int(diff / 86400)}d ago"
 
 
-def section_header(icon: str, title: str, subtitle: str = "") -> None:
-    """Render a consistent section header using native Streamlit."""
-    st.markdown(f"## {icon} {title}")
-    if subtitle:
-        st.caption(subtitle)
-    st.divider()
+def section_header(icon: str, title: str, subtitle: str = "", badges: list = None) -> None:
+    """Render a consistent, modern SaaS section header."""
+    badges_html = ""
+    if badges:
+        items = "".join([f'<span class="app-pill-badge">{b}</span>' for b in badges])
+        badges_html = f'<div class="app-badge-row">{items}</div>'
+
+    st.markdown(f"""
+<div class="app-header-wrap">
+  <div class="app-header-title">{icon} {title}</div>
+  {f'<div class="app-header-sub">{subtitle}</div>' if subtitle else ''}
+  {badges_html}
+</div>
+    """, unsafe_allow_html=True)
 
 
 def card(title: str = "", icon: str = "") -> None:
@@ -197,120 +220,609 @@ function moveCmp(v){{
 # ══════════════════════════════════════════════
 #  SIDEBAR
 # ══════════════════════════════════════════════
+# ══════════════════════════════════════════════
+#  TOP NAVIGATION BAR (Main App Mode)
+# ══════════════════════════════════════════════
 SECTIONS = [
     ("upload",    "📤", "Upload & Convert"),
     ("batch",     "📦", "Batch Processing"),
-    ("bg_remove", "✂️",  "Background Remover"),
-    ("ocr",       "🔤", "Text Extractor (OCR)"),
-    ("watermark", "🖊️",  "Watermark Studio"),
-    ("analytics", "📊", "Analytics Dashboard"),
-    ("history",   "🕓", "Download History"),
-    ("settings",  "⚙️",  "Settings"),
+    ("bg_remove", "✂️", "Background Remover"),
+    ("ocr",       "🔤", "Text Extractor"),
+    ("watermark", "🖊️", "Watermark Studio"),
+    ("analytics", "📊", "Analytics"),
+    ("history",   "🕒", "History"),
+    ("settings",  "⚙️", "Settings"),
 ]
 
-with st.sidebar:
-    # ── Branding ──
-    st.markdown("# 🌿 Image Studio Pro")
-    st.caption("Resize · Convert · Export — 100% Private")
-    st.divider()
-
-    # ── Navigation ──
-    st.markdown("**NAVIGATION**")
-    for sid, icon, label in SECTIONS:
-        active = st.session_state.section == sid
-        btn_label = f"{'▶ ' if active else ''}{icon}  {label}"
-        if st.button(btn_label, key=f"nav_{sid}", use_container_width=True):
-            st.session_state.section = sid
-            st.rerun()
-
-    st.divider()
-
-    # ── How to Use ──
-    st.markdown("**📖 HOW TO USE**")
-    st.markdown(
-        "**1️⃣ Upload** — Drop a JPG, PNG or WEBP  \n"
-        "**2️⃣ Preset** — Pick a size preset or enter custom  \n"
-        "**3️⃣ Format** — Choose output format  \n"
-        "**4️⃣ Quality** — Set compression (JPEG/WEBP)  \n"
-        "**5️⃣ Convert** — Click ⚡ Convert Image  \n"
-        "**6️⃣ Download** — Save your result"
-    )
-
-    st.divider()
-
-    # ── Format Guide ──
-    st.markdown("**🎨 FORMAT GUIDE**")
-    st.markdown(
-        "🟡 **JPEG** — Best for photos. Small file sizes. "
-        "Slight quality loss (lossy).  \n"
-        "🔵 **PNG** — Lossless quality. Supports transparency. "
-        "Larger files.  \n"
-        "🟢 **WEBP** — Modern format. Best compression + quality. "
-        "Widely supported."
-    )
-
-    st.divider()
-
-    # ── Preset Sizes ──
-    st.markdown("**📐 PRESET DIMENSIONS**")
-    preset_info = [
-        ("Instagram Post",    "1080 × 1080"),
-        ("Instagram Story",   "1080 × 1920"),
-        ("YouTube Thumbnail", "1280 × 720"),
-        ("WhatsApp DP",       "512 × 512"),
-        ("HD Wallpaper",      "1920 × 1080"),
-        ("Twitter Header",    "1500 × 500"),
-        ("Facebook Cover",    "820 × 312"),
-    ]
-    for name, size in preset_info:
-        col_n, col_s = st.columns([3, 2])
-        col_n.caption(name)
-        col_s.caption(f"`{size}`")
-
-    st.divider()
-
-    # ── Tips ──
-    st.markdown("**💡 TIPS**")
-    st.markdown(
-        "• Use **WEBP** for web images — smallest file size  \n"
-        "• Use **PNG** when you need a transparent background  \n"
-        "• **Quality 80–90** is ideal for JPEG — good balance  \n"
-        "• Enable **aspect ratio lock** to avoid distortion  \n"
-        "• Batch mode converts **multiple files at once**"
-    )
-
-    st.divider()
-
-    # ── Theme toggle ──
-    col1, col2 = st.columns(2)
-    with col1:
-        st.caption("🌙 Dark" if dark else "☀️ Light")
-    with col2:
-        if st.button("Switch", key="theme_toggle", use_container_width=True):
-            st.session_state.dark = not dark
-            st.rerun()
-
-    st.divider()
-
-    # ── About ──
-    st.markdown("**ℹ️ ABOUT**")
-    st.caption(
-        "Image Studio Pro v3.0  \n"
-        "Built with Python · Streamlit · Pillow  \n"
-        "🌐 [Live App](https://imageconverterpro.streamlit.app/)  \n"
-        "🔒 No uploads · No sign-up · Fully local"
-    )
-
-# Floating Docker for quick access
-st.markdown("""
-<div style="position:fixed;bottom:20px;right:20px;z-index:9999;
-            background:rgba(15,23,42,0.8);backdrop-filter:blur(12px);
-            padding:10px 16px;border-radius:12px;border:1px solid rgba(255,255,255,0.1);
-            display:flex;gap:12px;box-shadow:0 10px 25px rgba(0,0,0,0.3);">
-  <span style="font-size:16px;">✨</span>
-  <span style="font-size:12px;color:#cbd5e1;font-weight:600;">Image Studio Pro</span>
+def render_app_top_nav() -> None:
+    """Render the top horizontal navigation bar for the inside app."""
+    # ── 1. Top Bar: Logo + Brand on left, User Avatar / Auth on right ──
+    top_col1, top_col2 = st.columns([1.2, 1])
+    with top_col1:
+        st.markdown("""
+<div style="display:flex;align-items:center;gap:0.7rem;padding:0.4rem 0;">
+  <span style="font-size:1.5rem;">🌿</span>
+  <span style="font-weight:800;font-size:1.25rem;letter-spacing:-0.02em;">Image Studio Pro</span>
+  <span style="background:rgba(16,185,129,0.12);color:#10B981;padding:2px 8px;border-radius:99px;font-size:0.75rem;font-weight:700;border:1px solid rgba(16,185,129,0.25);">v3.0</span>
 </div>
+        """, unsafe_allow_html=True)
+    with top_col2:
+        if AUTH_AVAILABLE and is_logged_in():
+            user = get_current_user()
+            email = user.get("email", "user@example.com")
+            initials = (email[:2] if len(email) >= 2 else "US").upper()
+            u_col1, u_col2 = st.columns([2.5, 1])
+            with u_col1:
+                st.markdown(f"""
+<div style="display:flex;align-items:center;justify-content:flex-end;gap:0.6rem;padding-top:0.45rem;">
+  <div style="width:30px;height:30px;border-radius:50%;background:#10B981;color:#FFFFFF;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.80rem;box-shadow:0 2px 6px rgba(16,185,129,0.3);">{initials}</div>
+  <span style="font-size:0.86rem;font-weight:600;color:#94A3B8;">{email}</span>
+</div>
+                """, unsafe_allow_html=True)
+            with u_col2:
+                if st.button("Log out", key="app_top_logout", type="secondary", use_container_width=True):
+                    sign_out()
+                    st.session_state.history        = []
+                    st.session_state.analytics      = []
+                    st.session_state.history_seeded = False
+                    st.session_state.entered_app    = True
+                    st.rerun()
+        elif AUTH_AVAILABLE:
+            _, lg_btn_col, su_btn_col = st.columns([2, 1, 1.25])
+            with lg_btn_col:
+                st.markdown('<div class="nav-login-btn-anchor"></div>', unsafe_allow_html=True)
+                if st.button("Log In", key="app_top_login", use_container_width=True):
+                    st.session_state.app_auth = "login" if st.session_state.get("app_auth") != "login" else None
+                    st.rerun()
+            with su_btn_col:
+                st.markdown('<div class="violet-outline-btn-anchor"></div>', unsafe_allow_html=True)
+                if st.button("Sign Up Free", key="app_top_signup", use_container_width=True):
+                    st.session_state.app_auth = "signup" if st.session_state.get("app_auth") != "signup" else None
+                    st.rerun()
+
+    # ── Optional Inline Auth Drawer for In-App ──
+    if AUTH_AVAILABLE and not is_logged_in() and st.session_state.get("app_auth"):
+        _, auth_col, _ = st.columns([1.2, 2.6, 1.2])
+        with auth_col:
+            if st.session_state.app_auth == "login":
+                with st.form("app_login_form"):
+                    st.markdown("""
+<div class="auth-header">
+  <div class="auth-header-title">🔑 Welcome Back</div>
+  <div class="auth-header-caption">Log in to sync your conversion history and preferences.</div>
+</div>
+                    """, unsafe_allow_html=True)
+                    l_email = st.text_input("Email Address", placeholder="name@example.com", key="a_login_email")
+                    l_pw = st.text_input("Password", type="password", placeholder="••••••••", key="a_login_pw")
+                    l_sub = st.form_submit_button("Sign In →", use_container_width=True)
+                    if l_sub:
+                        ok, msg = sign_in(l_email, l_pw)
+                        if ok:
+                            st.session_state.app_auth = None
+                            st.rerun()
+                        else:
+                            st.error(msg)
+            elif st.session_state.app_auth == "signup":
+                with st.form("app_signup_form"):
+                    st.markdown("""
+<div class="auth-header">
+  <div class="auth-header-title">✨ Create Free Account</div>
+  <div class="auth-header-caption">No credit card required. Free forever with 100% local privacy.</div>
+</div>
+                    """, unsafe_allow_html=True)
+                    s_uname = st.text_input("Choose Username", placeholder="creative_user", key="a_signup_username")
+                    s_email = st.text_input("Email Address", placeholder="name@example.com", key="a_signup_email")
+                    s_pw = st.text_input("Password", type="password", placeholder="••••••••", key="a_signup_pw")
+                    s_sub = st.form_submit_button("Create Account →", use_container_width=True)
+                    if s_sub:
+                        ok, msg = sign_up(s_email, s_pw, s_uname)
+                        if ok:
+                            st.success(msg)
+                            st.session_state.app_auth = None
+                            st.rerun()
+                        else:
+                            st.error(msg)
+            st.write("")
+
+    st.markdown("""
+<div style="border-bottom: 1px solid rgba(0,0,0,0.08); margin: 0.4rem 0 1rem;"></div>
+    """, unsafe_allow_html=True)
+
+    # ── 2. Top Navigation Bar (8 Pills in 2 clean rows of 4) ──
+    row1 = SECTIONS[:4]
+    row2 = SECTIONS[4:]
+    for row in [row1, row2]:
+        cols = st.columns(4)
+        for idx, (sid, icon, label) in enumerate(row):
+            with cols[idx]:
+                is_active = (st.session_state.section == sid)
+                btn_type = "primary" if is_active else "secondary"
+                if st.button(f"{icon}  {label}", key=f"topnav_{sid}", type=btn_type, use_container_width=True):
+                    st.session_state.section = sid
+                    st.rerun()
+
+    st.markdown("""
+<div style="margin-bottom: 1.5rem;"></div>
+    """, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════
+#  MARKETING LANDING PAGE
+# ══════════════════════════════════════════════
+#  MARKETING LANDING PAGE — STEP 1: NAV + HERO
+# ══════════════════════════════════════════════
+def render_landing_page() -> None:
+    """Render the high-impact marketing landing page before entering the tool."""
+
+    # ── 1. Dark Hero Banner Section (Navbar + Hero + CTAs + Trust Badges) ──
+    with st.container():
+        st.markdown('<div class="hero-banner-anchor"></div>', unsafe_allow_html=True)
+
+        # ── Top Navbar ──
+        # ── Top Navbar ──
+        nav_col1, nav_col2, nav_col3 = st.columns([3.2, 3.8, 3.0])
+        with nav_col1:
+            st.markdown(
+                '<div style="display:flex;align-items:center;gap:8px;height:40px;">'
+                '<span style="font-size:1.35rem;">🌿</span>'
+                '<span class="hero-brand-title" style="font-weight:800;font-size:1.18rem;letter-spacing:-0.025em;color:#0F172A;">Image Studio Pro</span>'
+                '<span style="font-size:0.70rem;font-weight:700;padding:2px 8px;border-radius:99px;background:rgba(16,185,129,0.12);color:#10B981;border:1px solid rgba(16,185,129,0.25);">v3.0</span>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+        with nav_col2:
+            st.markdown(
+                '<div class="nav-links-center" style="display:flex;justify-content:center;align-items:center;gap:22px;height:40px;">'
+                '<a href="#features" class="nav-link-item">Features</a>'
+                '<a href="#workflows" class="nav-link-item">Workflows</a>'
+                '<a href="#why-us" class="nav-link-item">Why Us</a>'
+                '<a href="#faq" class="nav-link-item">FAQ</a>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+        with nav_col3:
+            if AUTH_AVAILABLE:
+                nc1, nc2 = st.columns([1, 1.25])
+                with nc1:
+                    st.markdown('<div class="nav-login-btn-anchor"></div>', unsafe_allow_html=True)
+                    if st.button("Log In", key="nav_login_btn", use_container_width=True):
+                        st.session_state.landing_auth = "login" if st.session_state.landing_auth != "login" else None
+                        st.rerun()
+                with nc2:
+                    st.markdown('<div class="violet-outline-btn-anchor"></div>', unsafe_allow_html=True)
+                    if st.button("Sign Up Free", key="nav_signup_btn", use_container_width=True):
+                        st.session_state.landing_auth = "signup" if st.session_state.landing_auth != "signup" else None
+                        st.rerun()
+            else:
+                if st.button("Launch Studio →", key="nav_enter_btn", type="primary", use_container_width=True):
+                    st.session_state.entered_app = True
+                    st.rerun()
+
+        # ── Optional Inline Auth Drawer (Styled Card) ──
+        if AUTH_AVAILABLE and st.session_state.landing_auth:
+            _, auth_col, _ = st.columns([1.2, 2.6, 1.2])
+            with auth_col:
+                if st.session_state.landing_auth == "login":
+                    with st.form("landing_login_form"):
+                        st.markdown("""
+<div class="auth-header">
+  <div class="auth-header-title">🔑 Welcome Back</div>
+  <div class="auth-header-caption">Log in to sync your conversion history and preferences.</div>
+</div>
+                        """, unsafe_allow_html=True)
+                        l_email = st.text_input("Email Address", placeholder="name@example.com", key="l_login_email")
+                        l_pw = st.text_input("Password", type="password", placeholder="••••••••", key="l_login_pw")
+                        l_sub = st.form_submit_button("Sign In & Launch Studio →", use_container_width=True)
+                        if l_sub:
+                            ok, msg = sign_in(l_email, l_pw)
+                            if ok:
+                                st.session_state.entered_app = True
+                                st.session_state.landing_auth = None
+                                st.rerun()
+                            else:
+                                st.error(msg)
+                elif st.session_state.landing_auth == "signup":
+                    with st.form("landing_signup_form"):
+                        st.markdown("""
+<div class="auth-header">
+  <div class="auth-header-title">✨ Create Free Account</div>
+  <div class="auth-header-caption">No credit card required. Free forever with 100% local privacy.</div>
+</div>
+                        """, unsafe_allow_html=True)
+                        s_uname = st.text_input("Choose Username", placeholder="creative_user", key="l_signup_username")
+                        s_email = st.text_input("Email Address", placeholder="name@example.com", key="l_signup_email")
+                        s_pw = st.text_input("Password", type="password", placeholder="••••••••", key="l_signup_pw")
+                        st.markdown('<div class="violet-btn-anchor"></div>', unsafe_allow_html=True)
+                        s_sub = st.form_submit_button("Create Account & Get Started →", use_container_width=True)
+                        if s_sub:
+                            ok, msg = sign_up(s_email, s_pw, s_uname)
+                            if ok:
+                                st.success(msg)
+                                st.session_state.entered_app = True
+                                st.session_state.landing_auth = None
+                                st.rerun()
+                            else:
+                                st.error(msg)
+                st.write("")
+                st.write("")
+
+        # ── 2. Hero Section ──
+        st.markdown("""
+<div class="landing-hero-box">
+  <div class="hero-pill-badge">
+    ⚡ 100% Local AI Image Studio &middot; Zero Cloud Uploads
+  </div>
+  <div class="hero-headline">
+    Transform, Clean &amp; Convert<br/>Images Instantly.
+  </div>
+  <div class="hero-subhead">
+    The privacy-first image toolkit with AI background removal, OCR text extraction, smart resizing, and watermarking — running 100% on your device.
+  </div>
+</div>
+        """, unsafe_allow_html=True)
+
+        # ── Two CTA buttons side by side ──
+        _, cta_c1, cta_c2, _ = st.columns([1.5, 2.5, 2.5, 1.5])
+        with cta_c1:
+            st.markdown('<div class="hero-cta-btn-anchor"></div>', unsafe_allow_html=True)
+            if st.button("🚀  Launch Studio (Instant)", key="hero_cta_primary", type="primary", use_container_width=True):
+                st.session_state.entered_app = True
+                st.rerun()
+        with cta_c2:
+            if AUTH_AVAILABLE:
+                st.markdown('<div class="hero-cta-btn-anchor"></div><div class="violet-btn-anchor"></div>', unsafe_allow_html=True)
+                if st.button("✨  Create Free Account", key="hero_cta_secondary", use_container_width=True):
+                    st.session_state.landing_auth = "signup"
+                    st.rerun()
+            else:
+                st.markdown('<div class="hero-cta-btn-anchor"></div>', unsafe_allow_html=True)
+                if st.button("📖  Explore Features", key="hero_cta_features", type="secondary", use_container_width=True):
+                    st.session_state.entered_app = True
+                    st.rerun()
+
+        # ── Trust points row below CTAs ──
+        st.markdown("""
+<div class="trust-row">
+  <div class="trust-item">🔒 100% Private (Runs on Device)</div>
+  <div class="trust-item">⚡ Instant Processing</div>
+  <div class="trust-item">🆓 No Sign-up Required</div>
+  <div class="trust-item">📐 7 Presets &amp; WebP</div>
+</div>
+        """, unsafe_allow_html=True)
+
+    # ── 3. Feature Suite Grid (8 cards) ──
+    st.markdown("""
+<div id="features" class="section-head-wrap">
+  <h2>Tools for Every Creative Need</h2>
+  <p>Eight powerful utilities built for creators, marketers, designers, and developers.</p>
+</div>
+    """, unsafe_allow_html=True)
+
+    features = [
+        ("upload",    "📤", "Upload & Convert",     "Resize to social presets, compress, and switch between JPEG, PNG, and WebP."),
+        ("batch",     "📦", "Batch Processing",     "Convert dozens of photos in one single run with unified quality settings."),
+        ("bg_remove", "✂️",  "Background Remover",   "AI-driven transparent PNG generation powered by deep learning u2net."),
+        ("ocr",       "🔤", "Text Extractor (OCR)", "Extract editable text from scanned documents, screenshots, and receipts."),
+        ("watermark", "🖊️",  "Watermark Studio",     "Protect assets with customizable copyright text or brand logo overlays."),
+        ("analytics", "📊", "Analytics Dashboard",  "Inspect real-time session stats, space saved, and export logs to CSV."),
+        ("history",   "🕓", "Download History",     "Review previous session conversions with one-click re-download."),
+        ("settings",  "⚙️",  "Settings & Themes",    "Toggle Dark/Light modes, clear session memory, and review privacy docs."),
+    ]
+
+    color_cycle = ["emerald", "violet", "sky"]
+
+    # Row 1 (4 columns)
+    f_cols1 = st.columns(4)
+    for idx, (sid, icon, title, desc) in enumerate(features[:4]):
+        var = color_cycle[idx % len(color_cycle)]
+        with f_cols1[idx]:
+            st.markdown(f"""
+<div class="feat-card feat-card-{var}">
+  <div>
+    <div class="feat-icon feat-icon-{var}">{icon}</div>
+    <div class="feat-title">{title}</div>
+    <div class="feat-desc">{desc}</div>
+  </div>
+</div>
+            """, unsafe_allow_html=True)
+            if st.button(f"Open {title.split(' ')[0]} →", key=f"feat_btn_{sid}", type="primary", use_container_width=True):
+                st.session_state.section = sid
+                st.session_state.entered_app = True
+                st.rerun()
+
+    st.write("")
+
+    # Row 2 (4 columns)
+    f_cols2 = st.columns(4)
+    for idx, (sid, icon, title, desc) in enumerate(features[4:]):
+        var = color_cycle[(idx + 4) % len(color_cycle)]
+        with f_cols2[idx]:
+            st.markdown(f"""
+<div class="feat-card feat-card-{var}">
+  <div>
+    <div class="feat-icon feat-icon-{var}">{icon}</div>
+    <div class="feat-title">{title}</div>
+    <div class="feat-desc">{desc}</div>
+  </div>
+</div>
+            """, unsafe_allow_html=True)
+            if st.button(f"Open {title.split(' ')[0]} →", key=f"feat_btn_{sid}", type="primary", use_container_width=True):
+                st.session_state.section = sid
+                st.session_state.entered_app = True
+                st.rerun()
+
+    # ── 4. Workflow Showcases (Starting with Workflow 1) ──
+    st.markdown("""
+<div id="workflows" class="section-head-wrap" style="margin-top: 4rem;">
+  <h2>Powerful Workflows, Simplified</h2>
+  <p>See how Image Studio Pro streamlines everyday media preparation.</p>
+</div>
+    """, unsafe_allow_html=True)
+
+    # Workflow 1: AI Background Removal (Left: Description, Right: Mockup)
+    w1_left, w1_right = st.columns([1.2, 1], gap="large")
+    with w1_left:
+        st.markdown("""
+<div style="padding-top: 1rem;">
+  <span class="workflow-badge workflow-badge-emerald">AI Vision Model</span>
+  <div class="workflow-title">Remove backgrounds in under 2 seconds.</div>
+  <div class="workflow-desc">No manual clipping or lasso tools. Built-in neural networks isolate people, products, and objects cleanly with sub-pixel edge detection.</div>
+</div>
+        """, unsafe_allow_html=True)
+        if st.button("Try Background Remover →", key="wf_btn_bg", type="primary", use_container_width=False):
+            st.session_state.section = "bg_remove"
+            st.session_state.entered_app = True
+            st.rerun()
+
+    with w1_right:
+        st.markdown("""
+<div class="mockup-canvas">
+  <div style="font-size:3rem;margin-bottom:0.5rem;">✂️</div>
+  <div style="font-weight:700;font-size:1.15rem;margin-bottom:6px;">Auto Cutout Engine</div>
+  <div style="font-size:0.88rem;color:#94A3B8;line-height:1.45;">Generates clean transparent RGBA PNGs locally on your hardware.</div>
+  <div style="margin-top:14px;padding:6px 14px;background:rgba(16,185,129,0.12);color:#10B981;border-radius:8px;font-size:0.82rem;font-weight:700;display:inline-block;">✓ Zero Data Uploaded</div>
+</div>
+        """, unsafe_allow_html=True)
+
+    st.write("")
+    st.write("")
+
+    # Workflow 2: Converter & Presets (Left: Mockup, Right: Description)
+    w2_left, w2_right = st.columns([1, 1.2], gap="large")
+    with w2_left:
+        st.markdown("""
+<div class="mockup-canvas">
+  <div style="font-size:3rem;margin-bottom:0.5rem;">📐</div>
+  <div style="font-weight:700;font-size:1.15rem;margin-bottom:6px;">Social Presets Matrix</div>
+  <div style="font-size:0.88rem;color:#94A3B8;line-height:1.45;">Instagram, YouTube, Twitter & HD Wallpaper dimensions.</div>
+  <div style="margin-top:14px;padding:6px 14px;background:rgba(124,58,237,0.12);color:#7C3AED;border-radius:8px;font-size:0.82rem;font-weight:700;display:inline-block;">⚡ Save Up to 80% Space via WebP</div>
+</div>
+        """, unsafe_allow_html=True)
+    with w2_right:
+        st.markdown("""
+<div style="padding-top: 1rem;">
+  <span class="workflow-badge workflow-badge-violet">Smart Compression</span>
+  <div class="workflow-title">Resize, re-encode, and optimize in one step.</div>
+  <div class="workflow-desc">Convert uncompressed PNGs and high-res JPEGs to modern WebP with variable quality sliders and aspect ratio locks.</div>
+</div>
+        """, unsafe_allow_html=True)
+        if st.button("Try Image Converter →", key="wf_btn_convert", type="primary", use_container_width=False):
+            st.session_state.section = "upload"
+            st.session_state.entered_app = True
+            st.rerun()
+
+    st.write("")
+    st.write("")
+
+    # Workflow 3: OCR Extractor (Left: Description, Right: Mockup)
+    w3_left, w3_right = st.columns([1.2, 1], gap="large")
+    with w3_left:
+        st.markdown("""
+<div style="padding-top: 1rem;">
+  <span class="workflow-badge workflow-badge-emerald">Neural OCR</span>
+  <div class="workflow-title">Turn visual text into editable copy.</div>
+  <div class="workflow-desc">Extract text from scanned documents, receipts, screenshots, and infographics directly into editable text areas and downloadable .txt files.</div>
+</div>
+        """, unsafe_allow_html=True)
+        if st.button("Try Text Extractor →", key="wf_btn_ocr", type="primary", use_container_width=False):
+            st.session_state.section = "ocr"
+            st.session_state.entered_app = True
+            st.rerun()
+    with w3_right:
+        st.markdown("""
+<div class="mockup-canvas">
+  <div style="font-size:3rem;margin-bottom:0.5rem;">🔤</div>
+  <div style="font-weight:700;font-size:1.15rem;margin-bottom:6px;">EasyOCR Engine</div>
+  <div style="font-size:0.88rem;color:#94A3B8;line-height:1.45;">Deep neural network for line & word boundary detection.</div>
+  <div style="margin-top:14px;padding:6px 14px;background:rgba(16,185,129,0.12);color:#10B981;border-radius:8px;font-size:0.82rem;font-weight:700;display:inline-block;">📄 Export to Plain Text (.txt)</div>
+</div>
+        """, unsafe_allow_html=True)
+
+    st.write("")
+    st.write("")
+
+    # Workflow 4: Watermark Studio (Left: Mockup, Right: Description)
+    w4_left, w4_right = st.columns([1, 1.2], gap="large")
+    with w4_left:
+        st.markdown("""
+<div class="mockup-canvas">
+  <div style="font-size:3rem;margin-bottom:0.5rem;">🖊️</div>
+  <div style="font-weight:700;font-size:1.15rem;margin-bottom:6px;">Brand Stamp Overlay</div>
+  <div style="font-size:0.88rem;color:#94A3B8;line-height:1.45;">Opacity, 360° rotation, and 9-point snapping controls.</div>
+  <div style="margin-top:14px;padding:6px 14px;background:rgba(124,58,237,0.12);color:#7C3AED;border-radius:8px;font-size:0.82rem;font-weight:700;display:inline-block;">🔒 Text & Logo PNG Compositing</div>
+</div>
+        """, unsafe_allow_html=True)
+    with w4_right:
+        st.markdown("""
+<div style="padding-top: 1rem;">
+  <span class="workflow-badge workflow-badge-violet">Asset Protection</span>
+  <div class="workflow-title">Protect and watermark your creative work.</div>
+  <div class="workflow-desc">Add customizable copyright signatures or transparent brand logos with fine-tuned opacity, scale, and placement controls.</div>
+</div>
+        """, unsafe_allow_html=True)
+        if st.button("Try Watermark Studio →", key="wf_btn_wm", type="primary", use_container_width=False):
+            st.session_state.section = "watermark"
+            st.session_state.entered_app = True
+            st.rerun()
+
+    # ── 5. Why Image Studio Pro ──
+    st.markdown("""
+<div id="why-us" class="section-head-wrap" style="margin-top: 4.5rem;">
+  <h2>Why Image Studio Pro?</h2>
+  <p>Honest, privacy-first software engineered for zero data leaks.</p>
+</div>
+    """, unsafe_allow_html=True)
+
+    why_cols = st.columns(3)
+    with why_cols[0]:
+        st.markdown("""
+<div class="why-card">
+  <div class="why-icon">🛡️</div>
+  <div class="why-title">100% Local & Private</div>
+  <div class="why-desc">Your photos never touch an external cloud server. Everything runs directly inside your computer's local Python runtime.</div>
+</div>
+        """, unsafe_allow_html=True)
+    with why_cols[1]:
+        st.markdown("""
+<div class="why-card">
+  <div class="why-icon">🧠</div>
+  <div class="why-title">Real Local AI Models</div>
+  <div class="why-desc">Powered by production-grade neural networks (u2net and EasyOCR) running natively on your hardware.</div>
+</div>
+        """, unsafe_allow_html=True)
+    with why_cols[2]:
+        st.markdown("""
+<div class="why-card">
+  <div class="why-icon">⚡</div>
+  <div class="why-title">Free, No Limits</div>
+  <div class="why-desc">No subscriptions, no artificial file size caps, and no forced app branding or watermarks on your exported images.</div>
+</div>
+        """, unsafe_allow_html=True)
+
+    # ── 6. FAQ Accordion ──
+    st.markdown("""
+<div id="faq" class="section-head-wrap" style="margin-top: 4.5rem;">
+  <h2>Frequently Asked Questions</h2>
+  <p>Everything you need to know about Image Studio Pro.</p>
+</div>
+    """, unsafe_allow_html=True)
+
+    with st.expander("❓ Are my photos uploaded to any third-party server?"):
+        st.write("Never. Every single operation — from image compression to AI background removal and OCR — runs 100% inside your local Python runtime. No external image servers are ever contacted.")
+
+    with st.expander("❓ Do I need an account to use Image Studio Pro?"):
+        st.write("No! You can use every feature without creating an account. Optional Supabase login is only provided if you want to sync your download history across visits.")
+
+    with st.expander("❓ Which file formats are supported?"):
+        st.write("Image Studio Pro supports JPEG/JPG, PNG, and modern WEBP formats for both input uploads and converted downloads.")
+
+    with st.expander("❓ Why does the first AI background removal or OCR take a moment?"):
+        st.write("On the first run during a session, the neural network models (u2net and EasyOCR) load into local system memory. All subsequent operations during that session execute instantly.")
+
+    with st.expander("❓ Can I process multiple images simultaneously?"):
+        st.write("Yes! Use the **Batch Processing** section to select and convert dozens of images at once with unified format and quality presets.")
+
+    # ── 7. Bottom Hero CTA ──
+    st.markdown("""
+<div class="bottom-cta-banner">
+  <div class="bottom-cta-title">Ready to transform your images with total privacy?</div>
+  <div class="bottom-cta-sub">Launch Image Studio Pro now — free forever with no sign-up required.</div>
+</div>
+    """, unsafe_allow_html=True)
+
+    _, bcta_col, _ = st.columns([2, 3, 2])
+    with bcta_col:
+        if st.button("🚀  Launch Image Studio Now", key="bottom_cta_launch", type="primary", use_container_width=True):
+            st.session_state.entered_app = True
+            st.rerun()
+
+    # ── 8. Footer ──
+    st.markdown("""
+<div class="landing-footer">
+  <strong>🌿 Image Studio Pro v3.0</strong> &middot; Built with Python, Streamlit, Pillow, rembg, EasyOCR &amp; Plotly<br/>
+  100% Open Source &middot; Fully Local Processing &middot; Privacy Guaranteed
+</div>
+    """, unsafe_allow_html=True)
+
+
+
+
+
+
+# ══════════════════════════════════════════════
+#  GLOBAL SCRIPT (Tilt, Nav Active & Scroll Reveal)
+# ══════════════════════════════════════════════
+st.markdown("""
+<script>
+(function(){
+  /* ── Hero 3D Tilt ── */
+  function initHeroTilt(){
+    document.querySelectorAll('.hero-3d-wrap, .showcase-stage').forEach(function(el){
+      if(el.__tiltBound) return;
+      el.__tiltBound = true;
+      el.addEventListener('mousemove',function(e){
+        var r=el.getBoundingClientRect();
+        var dx=(e.clientX-(r.left+r.width/2))/(r.width/2);
+        var dy=(e.clientY-(r.top+r.height/2))/(r.height/2);
+        el.style.transform='perspective(1200px) rotateY('+(dx*3)+'deg) rotateX('+(-dy*3)+'deg)';
+        el.style.transition='transform 0.10s ease';
+      });
+      el.addEventListener('mouseleave',function(){
+        el.style.transform='perspective(1200px) rotateY(0) rotateX(0)';
+        el.style.transition='transform 0.45s ease';
+      });
+    });
+  }
+
+  /* ── Sidebar Active Nav Indicator ── */
+  function markActiveNav(){
+    var btns = document.querySelectorAll('[data-testid="stSidebar"] button');
+    btns.forEach(function(b){
+      b.classList.remove('nav-active');
+      if((b.innerText||b.textContent||'').trimStart().charCodeAt(0) === 0x25B6){
+        b.classList.add('nav-active');
+      }
+    });
+  }
+
+  /* ── Scroll Reveal via IntersectionObserver ── */
+  var revealObserver = null;
+  function initScrollReveal(){
+    if(!window.IntersectionObserver) return;
+    if(!revealObserver){
+      revealObserver = new IntersectionObserver(function(entries){
+        entries.forEach(function(entry){
+          if(entry.isIntersecting){
+            entry.target.classList.add('is-revealed');
+          }
+        });
+      }, { threshold: 0.08 });
+    }
+    document.querySelectorAll('.reveal-on-scroll:not(.is-revealed)').forEach(function(el){
+      revealObserver.observe(el);
+    });
+  }
+
+  function handleMutations(){
+    initHeroTilt();
+    markActiveNav();
+    initScrollReveal();
+  }
+
+  if(!window.__stAppObs){
+    var _t = null;
+    window.__stAppObs = new MutationObserver(function(){
+      clearTimeout(_t);
+      _t = setTimeout(handleMutations, 60);
+    });
+    window.__stAppObs.observe(document.body, {childList:true, subtree:true});
+  }
+
+  handleMutations();
+})();
+</script>
 """, unsafe_allow_html=True)
+
 
 
 # ══════════════════════════════════════════════
@@ -318,36 +830,16 @@ st.markdown("""
 # ══════════════════════════════════════════════
 def render_upload() -> None:
     """Render the single-image resize/convert section."""
-    # ── Hero Banner — 3D Glassmorphism ──
-    st.markdown("""\
-<div class="hero-3d-wrap tilt-3d">
-  <div class="hero-float-card" style="top:16px;right:20px;">
-    🖼️&nbsp; PNG &rarr; WEBP &nbsp;<span style="color:#6ee7b7;">-62%</span>
-  </div>
-  <div class="hero-float-card" style="top:80px;right:12px;">
-    ✓&nbsp; <span style="color:#67e8f9;">Background Removed</span>
-  </div>
-  <div class="hero-float-card" style="bottom:20px;right:16px;">
-    🤖&nbsp; OCR&nbsp;<span style="color:#c4b5fd;">98.4%</span>
-  </div>
-  <div class="hero-content-overlay">
-    <div style="margin-bottom:0.85rem;">
-      <span class="badge-3d badge-emerald">🌿 Image Studio Pro</span>
-      <span class="badge-3d badge-cyan">🔒 100% Private</span>
-    </div>
-    <div class="hero-gradient-title">Image Resizer &amp; Converter</div>
-    <div class="hero-subtitle">
-      Upload &middot; Resize &middot; Convert &middot; Remove BG &middot; Extract Text &middot; Watermark
-      <span class="hero-subtitle-sub">All processing runs locally — your images never leave your device.</span>
-    </div>
-    <div style="display:flex;flex-wrap:wrap;gap:0.15rem;">
-      <span class="badge-3d badge-emerald" style="animation-delay:0.05s;">⚡ Instant</span>
-      <span class="badge-3d badge-cyan" style="animation-delay:0.12s;">📦 Batch Mode</span>
-      <span class="badge-3d badge-purple" style="animation-delay:0.20s;">✂️ AI BG Removal</span>
-      <span class="badge-3d badge-white" style="animation-delay:0.28s;">🔤 OCR Extractor</span>
-      <span class="badge-3d badge-emerald" style="animation-delay:0.36s;">📐 7 Presets</span>
-      <span class="badge-3d badge-cyan" style="animation-delay:0.44s;">🌓 Dark Mode</span>
-    </div>
+    # ── Section Header — Modern Clean SaaS ──
+    st.markdown("""
+<div class="app-header-wrap">
+  <div class="app-header-title">📤 Upload &amp; Convert</div>
+  <div class="app-header-sub">Resize, compress, and switch between JPEG, PNG, and modern WebP with zero cloud uploads.</div>
+  <div class="app-badge-row">
+    <span class="app-pill-badge">🔒 100% Private</span>
+    <span class="app-pill-badge">⚡ Instant Processing</span>
+    <span class="app-pill-badge">📐 7 Presets</span>
+    <span class="app-pill-badge">✨ WebP Ready</span>
   </div>
 </div>
     """, unsafe_allow_html=True)
@@ -465,6 +957,8 @@ def render_upload() -> None:
             "ts":       datetime.now().isoformat(),
         })
         st.session_state.history = st.session_state.history[:30]
+        if AUTH_AVAILABLE:                                    # ── auth: persist entry for logged-in users
+            save_history_entry(st.session_state.history[0])
 
         # ── Analytics ──
         log_operation(OP_RESIZE, len(raw), len(out_bytes), out_fmt, uploaded.name)
@@ -500,7 +994,7 @@ def render_batch() -> None:
     st.write(f"**{len(files)} image(s) selected**")
 
     if st.button(f"⚡  Convert All {len(files)} Images",
-                 use_container_width=True, key="batch_go"):
+                 type="primary", use_container_width=True, key="batch_go"):
         results = []
         prog = st.progress(0, "Starting…")
         for i, f in enumerate(files):
@@ -528,6 +1022,8 @@ def render_batch() -> None:
                 "dims":     f"{iw} × {ih}",
                 "ts":       datetime.now().isoformat(),
             })
+            if AUTH_AVAILABLE:                                # ── auth: persist entry for logged-in users
+                save_history_entry(st.session_state.history[0])
             # ── Analytics ──
             log_operation(OP_BATCH, len(raw), len(out), b_fmt, f.name)
 
@@ -595,7 +1091,7 @@ def render_bg_remove() -> None:
     orig_size_str = get_file_size(raw)
 
     # ── Process button ──
-    if st.button("🪄  Remove Background", use_container_width=True, key="bg_go"):
+    if st.button("🪄  Remove Background", type="primary", use_container_width=True, key="bg_go"):
         with st.spinner("🧠 AI is removing the background… (first run may take a moment to load the model)"):
             try:
                 out_bytes, elapsed = remove_background(raw)
@@ -603,6 +1099,20 @@ def render_bg_remove() -> None:
                 st.error(f"Background removal failed: {exc}", icon="❌")
                 return
 
+        # ── History ──
+        _bg_src = Image.open(io.BytesIO(raw))
+        _bg_w, _bg_h = _bg_src.size
+        st.session_state.history.insert(0, {
+            "name":     uploaded.name,
+            "orig_fmt": uploaded.name.rsplit(".", 1)[-1].upper(),
+            "out_fmt":  "PNG",
+            "orig_sz":  len(raw),
+            "out_sz":   len(out_bytes),
+            "dims":     f"{_bg_w} × {_bg_h}",
+            "ts":       datetime.now().isoformat(),
+        })
+        if AUTH_AVAILABLE:                                    # ── auth: persist for logged-in users
+            save_history_entry(st.session_state.history[0])
         st.session_state["_bg_result"]   = out_bytes
         st.session_state["_bg_elapsed"]  = elapsed
         st.session_state["_bg_filename"] = uploaded.name
@@ -655,8 +1165,11 @@ def render_bg_remove() -> None:
 # ══════════════════════════════════════════════
 def render_ocr() -> None:
     """Render the EasyOCR text extraction section."""
-    section_header("🔤", "Text Extractor (OCR)",
-                   "Extract text from images, screenshots, and scanned documents.")
+    section_header(
+        "🔤", "Text Extractor (OCR)",
+        "Extract text from images, screenshots, and scanned documents with local EasyOCR.",
+        badges=["🔒 100% Private", "🧠 Neural EasyOCR", "📄 Export to .TXT", "✏️ Live Editing"],
+    )
 
     # ── Dependency check ──
     if not EASYOCR_AVAILABLE:
@@ -699,13 +1212,27 @@ def render_ocr() -> None:
         st.caption("Currently supports English. Multi-language support can be added via the languages list in ocr_processor.py.")
         st.write("")
 
-        if st.button("🔍  Extract Text", use_container_width=True, key="ocr_go"):
+        if st.button("🔍  Extract Text", use_container_width=True, type="primary", key="ocr_go"):
             with st.spinner("🧠 Running OCR… (first run may take a moment to load the model)"):
                 try:
                     result = extract_text(img, languages=["en"])
                     st.session_state["ocr_result"]   = result
                     st.session_state["ocr_filename"] = uploaded.name
                     st.session_state["ocr_raw_len"]  = len(raw)
+                    # ── History ──
+                    _ocr_src = Image.open(io.BytesIO(raw))
+                    _ocr_w, _ocr_h = _ocr_src.size
+                    st.session_state.history.insert(0, {
+                        "name":     uploaded.name,
+                        "orig_fmt": uploaded.name.rsplit(".", 1)[-1].upper(),
+                        "out_fmt":  "TXT",
+                        "orig_sz":  len(raw),
+                        "out_sz":   len(result["text"].encode("utf-8")),
+                        "dims":     f"{_ocr_w} × {_ocr_h}",
+                        "ts":       datetime.now().isoformat(),
+                    })
+                    if AUTH_AVAILABLE:                        # ── auth: persist for logged-in users
+                        save_history_entry(st.session_state.history[0])
                     st.success(f"✅ Extracted {result['line_count']} text region(s)!", icon="🎉")
                 except Exception as exc:
                     st.error(f"OCR failed: {exc}", icon="❌")
@@ -765,7 +1292,7 @@ def render_ocr() -> None:
                 use_container_width=True,
             )
         with clear_col:
-            if st.button("🗑️ Clear Result", key="ocr_clear", use_container_width=True):
+            if st.button("🗑️ Clear Result", key="ocr_clear", type="secondary", use_container_width=True):
                 st.session_state["ocr_result"] = None
                 st.rerun()
 
@@ -780,8 +1307,11 @@ def render_ocr() -> None:
 # ══════════════════════════════════════════════
 def render_watermark() -> None:
     """Render the watermark (text + logo) section."""
-    section_header("🖊️", "Watermark Studio",
-                   "Add text or logo watermarks to your images with full control.")
+    section_header(
+        "🖊️", "Watermark Studio",
+        "Add text or logo watermarks to your images with fine-tuned opacity, scale, and placement controls.",
+        badges=["🔒 100% Private", "🔤 Text & Logo Stamping", "🔄 360° Rotation", "📍 9-Point Snapping"],
+    )
 
     st.markdown("### 📤 Upload Base Image")
     uploaded = st.file_uploader(
@@ -826,7 +1356,7 @@ def render_watermark() -> None:
             h = wm_col_hex.lstrip("#")
             wm_rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
-            if st.button("✅  Apply Text Watermark", use_container_width=True, key="wm_text_apply"):
+            if st.button("✅  Apply Text Watermark", use_container_width=True, type="primary", key="wm_text_apply"):
                 with st.spinner("Applying watermark…"):
                     try:
                         wm_result = add_text_watermark(
@@ -841,6 +1371,20 @@ def render_watermark() -> None:
                         applied_type = "Text Watermark"
                         st.session_state["_wm_result"] = wm_result
                         st.session_state["_wm_type"]   = applied_type
+                        # ── History ──
+                        _wmt_w, _wmt_h = wm_result.size
+                        _wmt_out = save_image(wm_result, "PNG", quality=92)
+                        st.session_state.history.insert(0, {
+                            "name":     uploaded.name,
+                            "orig_fmt": uploaded.name.rsplit(".", 1)[-1].upper(),
+                            "out_fmt":  "PNG",
+                            "orig_sz":  len(raw),
+                            "out_sz":   len(_wmt_out),
+                            "dims":     f"{_wmt_w} × {_wmt_h}",
+                            "ts":       datetime.now().isoformat(),
+                        })
+                        if AUTH_AVAILABLE:                    # ── auth: persist for logged-in users
+                            save_history_entry(st.session_state.history[0])
                         st.success("✅ Text watermark applied!", icon="🎉")
                     except Exception as exc:
                         st.error(f"Failed to apply watermark: {exc}", icon="❌")
@@ -866,7 +1410,7 @@ def render_watermark() -> None:
             wl_opac  = st.slider("Opacity", 0.05, 1.0, 0.80, 0.05, key="wl_opac")
             wl_pos   = st.selectbox("Position", POSITIONS, index=4, key="wl_pos")
 
-            if logo_file and st.button("✅  Apply Logo Watermark", use_container_width=True, key="wm_logo_apply"):
+            if logo_file and st.button("✅  Apply Logo Watermark", use_container_width=True, type="primary", key="wm_logo_apply"):
                 try:
                     logo_bytes = logo_file.read()
                     logo_img   = load_image(logo_bytes)
@@ -881,6 +1425,20 @@ def render_watermark() -> None:
                     applied_type = "Logo Watermark"
                     st.session_state["_wm_result"] = wm_result
                     st.session_state["_wm_type"]   = applied_type
+                    # ── History ──
+                    _wml_w, _wml_h = wm_result.size
+                    _wml_out = save_image(wm_result, "PNG", quality=92)
+                    st.session_state.history.insert(0, {
+                        "name":     uploaded.name,
+                        "orig_fmt": uploaded.name.rsplit(".", 1)[-1].upper(),
+                        "out_fmt":  "PNG",
+                        "orig_sz":  len(raw),
+                        "out_sz":   len(_wml_out),
+                        "dims":     f"{_wml_w} × {_wml_h}",
+                        "ts":       datetime.now().isoformat(),
+                    })
+                    if AUTH_AVAILABLE:                        # ── auth: persist for logged-in users
+                        save_history_entry(st.session_state.history[0])
                     st.success("✅ Logo watermark applied!", icon="🎉")
                 except Exception as exc:
                     st.error(f"Failed to apply logo: {exc}", icon="❌")
@@ -927,7 +1485,7 @@ def render_watermark() -> None:
                 )
 
         # Clear button
-        if st.button("🗑️ Clear Watermark", key="wm_clear", use_container_width=False):
+        if st.button("🗑️ Clear Watermark", key="wm_clear", type="secondary", use_container_width=False):
             st.session_state.pop("_wm_result", None)
             st.session_state.pop("_wm_type", None)
             st.rerun()
@@ -938,8 +1496,11 @@ def render_watermark() -> None:
 # ══════════════════════════════════════════════
 def render_analytics() -> None:
     """Render the session analytics dashboard."""
-    section_header("📊", "Analytics Dashboard",
-                   "Track all image processing operations during this session.")
+    section_header(
+        "📊", "Analytics Dashboard",
+        "Track image operations, storage space saved, and format distribution across your session.",
+        badges=["🔒 100% Private", "📈 Interactive Plotly Charts", "💾 Storage Savings", "📄 CSV Export"],
+    )
 
     analytics_data = st.session_state.get("analytics", [])
 
@@ -965,7 +1526,7 @@ def render_analytics() -> None:
             use_container_width=True,
         )
     with btn2:
-        if st.button("🗑️ Clear Analytics", key="clear_analytics", use_container_width=True):
+        if st.button("🗑️ Clear Analytics", key="clear_analytics", type="secondary", use_container_width=True):
             st.session_state.analytics = []
             st.rerun()
 
@@ -1034,8 +1595,11 @@ def render_analytics() -> None:
 def render_history() -> None:
     """Render the session download history table."""
     h = st.session_state.history
-    section_header("🕓", "Download History",
-                   f"{len(h)} conversion{'s' if len(h) != 1 else ''} this session.")
+    section_header(
+        "🕒", "Download History",
+        f"Review and manage {len(h)} processed file{'s' if len(h) != 1 else ''} from this session.",
+        badges=["🔒 100% Private", "⚡ Session Persistent", "📊 Detailed Stats"],
+    )
 
     if not h:
         st.info("No history yet. Convert an image to see it here.", icon="ℹ️")
@@ -1043,7 +1607,7 @@ def render_history() -> None:
 
     col_btn, _ = st.columns([1, 4])
     with col_btn:
-        if st.button("🗑️ Clear History", key="clear_hist"):
+        if st.button("🗑️ Clear History", key="clear_hist", type="secondary"):
             st.session_state.history = []
             st.rerun()
 
@@ -1080,7 +1644,11 @@ def render_history() -> None:
 # ══════════════════════════════════════════════
 def render_settings() -> None:
     """Render the application settings and information page."""
-    section_header("⚙️", "Settings", "App preferences and information.")
+    section_header(
+        "⚙️", "Settings & Themes",
+        "Configure visual theme preferences, reset session data, and review offline privacy documentation.",
+        badges=["🔒 100% Private", "🌓 Light / Dark Modes", "⚡ Session Controls", "🌿 Image Studio Pro v3.0"],
+    )
 
     # ── Preferences ──
     st.markdown("### 🎨 Preferences")
@@ -1088,11 +1656,11 @@ def render_settings() -> None:
 
     sc1, sc2 = st.columns(2)
     with sc1:
-        if st.button("🌓 Toggle Theme", key="settings_theme", use_container_width=True):
+        if st.button("🌓 Toggle Theme", key="settings_theme", type="primary", use_container_width=True):
             st.session_state.dark = not dark
             st.rerun()
     with sc2:
-        if st.button("🗑️ Clear All Data", key="settings_clear", use_container_width=True):
+        if st.button("🗑️ Clear All Data", key="settings_clear", type="secondary", use_container_width=True):
             st.session_state.history       = []
             st.session_state.batch_results = []
             st.session_state.analytics     = []
@@ -1167,4 +1735,10 @@ _route = {
     "history":   render_history,
     "settings":  render_settings,
 }
-_route.get(st.session_state.section, render_upload)()
+
+if not st.session_state.entered_app:
+    render_landing_page()
+else:
+    render_app_top_nav()
+    _route.get(st.session_state.section, render_upload)()
+

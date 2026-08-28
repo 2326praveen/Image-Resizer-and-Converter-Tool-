@@ -4,3 +4,6 @@ rembg[cpu]
 easyocr
 plotly
 pandas
+numpy
+certifi
+supabase
